@@ -1,0 +1,344 @@
+You are a senior Python platform engineer and distributed systems architect. Investigate an enterprise agent execution platform running on OpenShift/Kubernetes.
+
+Do not immediately modify code. First inspect the entire implementation and produce an evidence-based diagnosis. Then propose fixes in priority order, and only after that suggest exact code changes.
+
+## System Context
+
+* API service receives or creates a run/request.
+* Request is sent through Kafka.
+* An executor running in OpenShift/OCP consumes the Kafka request.
+* The executor uses the request/run configuration to process work items stored in a database.
+* A run may contain anywhere from 1 work item to a very large number of work items.
+* Executor repeatedly claims work items from the database.
+* Work item statuses: NEW, PENDING, CLAIMED, IN_PROGRESS, SUCCESS, FAILED, RETRY.
+* Agents are implemented using Google ADK or an ADK-based agent framework.
+* Executor supports parallel processing with a configurable maximum of approximately 5 threads/workers.
+* Each worker/agent claims a record from the database, executes the configured flow, and updates the database.
+* Executor continues checking for NEW, PENDING, FAILED, RETRY, or recoverable items until no work remains.
+* Result-processing logic traverses the ADK/agent output to determine: success, failure, in-progress, error details, error message, final output.
+* Once all work items for the run are completed, the executor updates run completion status in the database and publishes completion/status information back through Kafka.
+
+## Primary Problem
+
+Memory usage in the executor pod keeps increasing and is not released — even when parallel execution is disabled, thread max is small (~5), and a run finishes successfully. Pod RSS/memory reported by OpenShift remains high or continues increasing between work items or between runs.
+
+We need to determine whether this is:
+
+1. a real Python object/reference leak
+2. ADK session/event/history retention
+3. agent output/result retention
+4. thread/future retention
+5. database connection/session leakage
+6. HTTP/client/tool connection leakage
+7. logging/tracing/telemetry buffering
+8. cache growth
+9. asyncio task retention
+10. Python garbage collection behavior
+11. CPython/glibc allocator fragmentation/high-water-mark behavior
+12. third-party library native-memory retention
+13. deployment/runtime configuration (including cgroup memory accounting artifacts)
+14. a combination of the above
+
+---
+
+# PHASE 0 — Baseline Recon (do this first)
+
+Before touching code, capture the facts that scope everything downstream:
+
+* Python version, ADK/framework version, base image, glibc vs musl
+* DB driver/library and version (SQLAlchemy, psycopg, asyncpg, pyodbc, etc.)
+* Current OCP memory `requests`/`limits` for the executor pod
+* Is the pod actually being OOMKilled, or just running "high"? Get restart count and reason (`kubectl describe pod`, `OOMKilled` events)
+* Observed growth rate: MB per work item? MB per run? Or a one-time step increase that then plateaus?
+* Does memory reset on pod restart and grow again identically, or does the growth rate change across restarts?
+* Confirm who/what has access to run diagnostics: repo read access, pod exec access, ability to deploy a lower-environment build with instrumentation
+
+Without this, later phases risk chasing a leak that's actually a fixed-size warm-up.
+
+---
+
+# PHASE 1 — Repository Discovery
+
+Inspect repository structure before making assumptions. Identify all repos/modules related to: executor, agent runtime, Google ADK, API service, Kafka producer/consumer, DB repositories/DAO, work-item claiming, work-item status updates, run lifecycle, retry logic, output/result parsing, session management, memory management, thread management, asyncio, HTTP clients, tool clients, MCP/API tools, logging, tracing, OpenTelemetry, metrics, caches, Kubernetes/OpenShift deployment, Helm, Dockerfile, ConfigMap, secrets/configuration, resource limits, autoscaling.
+
+Produce a repository map (Executor Repo / API Repo / Deployment), each broken into its major components. Do not change anything yet.
+
+---
+
+# PHASE 2 — Trace One Complete Run
+
+Trace one request end to end:
+
+API request → DB run creation → work-item creation → Kafka publish → executor Kafka consume → run initialization → worker/thread initialization → ADK agent creation → ADK Runner creation → ADK session creation → work-item claim → execution → tool invocation → output collection → result traversal → DB update → next record → run completion detection → Kafka completion publish → cleanup.
+
+For every step identify: object created, owner, scope, expected lifetime, actual lifetime, explicit close/delete/cleanup logic, whether references remain after work-item completion, whether references remain after run completion.
+
+Produce a lifecycle table, e.g.:
+
+| Object | Created At | Expected Lifetime | Cleanup | Potential Leak |
+|---|---|---|---|---|
+| ADK Runner | run initialization | run | ? | yes/no |
+| ADK Session | per item | item | ? | yes/no |
+| ThreadPoolExecutor | run | run | shutdown? | yes/no |
+| Future | per item | item | removed? | yes/no |
+| DB Session | per item | item | close? | yes/no |
+| HTTP Client | tool startup | reusable/run | close? | yes/no |
+
+---
+
+# PHASE 3 — Investigate ADK Object Lifetime
+
+Search for: `Agent(`, `Runner(`, `InMemorySessionService`, `DatabaseSessionService`, `MemoryService`, `Session`, `session_service`, `runner.run`, `runner.run_async`, `InvocationContext`, `ToolContext`, events, event, history, messages, artifacts, state, callbacks, session_id, user_id, app_name.
+
+Determine: Is Agent/Runner created once or once per item? Is SessionService global, per-run, or per-item? Are sessions explicitly deleted? Are events/history retained? Is `InMemorySessionService` in use, and does it accumulate sessions for the pod's lifetime? Are tool outputs stored in session state? Are artifacts held in memory? Do callbacks/closures retain references to Runner/Agent/Session? Are sessions reused incorrectly across unrelated items or retained after completion?
+
+Flag any growing structure such as `self.sessions`, `self.runners`, `self.agents`, `self.events`, `self.results`, `self.history`, `self.contexts`, `self.work_items`.
+
+---
+
+# PHASE 4 — Investigate Agent Result Traversal
+
+Search for: `list(runner.run(...))`, `events.append(...)`, `all_events.extend(...)`, `responses.append(...)`, `results.append(...)`, `output.append(...)`, `history.append(...)`, `json.dumps(large_object)`, `copy.deepcopy(...)`.
+
+Determine whether the implementation materializes the entire event stream, retains every ADK event/tool output/intermediate state, loads attachments into memory, holds raw API responses after processing, retains both parsed and raw versions, or keeps successful results in a global list. Check whether exceptions retain locals containing large response objects.
+
+Preferred pattern — stream, don't accumulate:
+
+​```python
+for event in runner.run(...):
+    # inspect event, capture only:
+    # final_status, final_message, error_code, error_message, output_reference
+​```
+
+---
+
+# PHASE 5 — Investigate Threading
+
+Search for: `ThreadPoolExecutor`, `threading.Thread`, `executor.submit`, `Future`, `as_completed`, `wait`, `futures`, `worker`, `queue.Queue`.
+
+Determine: where the pool is created; whether it's recreated repeatedly; whether `shutdown()` is called; whether futures are retained after completion; whether a global futures list grows; whether thread-local storage holds ADK/runtime objects or never-removed DB sessions; whether the sequential code path still spins up thread pools/background workers unnecessarily.
+
+Verify completed entries are actually removed from any `self.futures.append(...)` / `future_results[id] = future` pattern.
+
+---
+
+# PHASE 6 — Investigate AsyncIO
+
+If asyncio is present: verify every task is awaited; completed tasks aren't stored permanently; cancelled tasks are awaited; background task collections discard completed tasks (`background_tasks.add(task)` should always pair with `task.add_done_callback(background_tasks.discard)`); exceptions are consumed; async generators/clients are closed; event loops aren't repeatedly created and retained.
+
+---
+
+# PHASE 7 — Database Connection and Session Investigation
+
+Identify DB technology (SQLAlchemy, psycopg, pyodbc, asyncpg, SQL Server, PostgreSQL, Oracle, other).
+
+Inspect engine creation, session factory, session lifecycle, connection pool, cursor/transaction/result-set lifecycle. Verify `session.close()`, `connection.close()`, `cursor.close()`, rollback on exception, and context-manager usage.
+
+**Pool warm-up caveat:** a connection pool growing to its configured `pool_size`/`max_overflow` on the first several requests is expected behavior, not a leak — confirm current growth is *past* the configured pool ceiling before flagging it.
+
+Check whether large query results are loaded with `.fetchall()` / `.all()` / `list(query)` instead of streaming/batching, and whether the work-item pull logic loads all items into memory instead of claiming one item or a small bounded batch at a time.
+
+If SQLAlchemy: determine whether a single long-running Session accumulates all processed entities via the ORM identity map across thousands of work items. Recommend `session.expunge_all()` / per-unit-of-work sessions if so.
+
+---
+
+# PHASE 8 — Work Item Claim Loop Investigation
+
+Trace the NEW/PENDING/FAILED/RETRY/IN_PROGRESS polling loop. Determine whether it repeatedly queries full result sets, accumulates previously seen records, appends claimed items to run-level collections, repeatedly recreates agents/runners/sessions, recurses, or schedules new tasks before old ones fully release. Verify termination conditions and rule out accidental rescan behavior.
+
+---
+
+# PHASE 9 — HTTP/API/Tool Client Investigation
+
+Search for: `requests.Session`, `httpx.Client`, `httpx.AsyncClient`, `aiohttp.ClientSession`, grpc, boto3 clients, DB SDK clients, MCP/tool clients.
+
+Determine whether clients are recreated per work item vs. reused correctly, explicitly closed, or retaining response bodies/connection pools/large buffers. Check for `response.content` / `response.text` / `response.json()` on large responses, and whether responses are stored inside execution/session history.
+
+---
+
+# PHASE 10 — Logging, Tracing and Observability
+
+Inspect logging, OpenTelemetry, tracer/span usage, Langfuse/Datadog/Splunk/Prometheus, custom or ADK tracing. Determine whether spans are ended, exporters batch indefinitely, log/queue handlers grow unbounded, trace attributes include full JSON payloads, agent inputs/outputs are copied into telemetry, exception locals are captured, or debug logging accumulates. **Diagnostic shortcut: disable tracing in a lower environment and see if memory behavior changes** — fastest way to rule this phase in or out.
+
+---
+
+# PHASE 11 — Python Cache and Global State Investigation
+
+Search for module-level mutable structures (`[]`, `{}`, `defaultdict`, `deque`, `set`, cache, memo, registry, history, sessions, results), `@lru_cache`/`@cache` decorators without bounded `maxsize`, and singleton objects. Flag any structure whose size grows proportional to work items, runs, sessions, errors, or events processed.
+
+---
+
+# PHASE 12 — Garbage Collector Investigation
+
+In a lower environment, instrument RSS before/after execution and after `gc.collect()` for items 1, 2, 5, 10, 25, 50, 100:
+
+​```python
+import os, gc, psutil
+process = psutil.Process(os.getpid())
+def rss_mb(): return process.memory_info().rss / 1024 / 1024
+
+print("before", rss_mb())
+result = execute_item(...)
+print("after execution", rss_mb())
+del result
+gc.collect()
+print("after gc", rss_mb())
+​```
+
+Produce a table of RSS before/after/after-cleanup, GC object count, ADK session count, thread count, DB connection count per checkpoint. Determine whether memory plateaus or grows continuously.
+
+---
+
+# PHASE 13 — malloc_trim Diagnostic (lower environment only)
+
+​```python
+import ctypes, gc
+gc.collect()
+libc = ctypes.CDLL("libc.so.6")
+libc.malloc_trim(0)
+​```
+
+Measure RSS before GC, after GC, after `malloc_trim`.
+
+* Large drop after `malloc_trim` (e.g. 1800→1750→800 MB) → allocator fragmentation/high-water-mark, not a live-object leak.
+* Small drop throughout (e.g. 1800→1780→1750 MB) → live objects/references are likely still held.
+
+Do not deploy `malloc_trim` to production blindly — diagnostic only at this stage.
+
+---
+
+# PHASE 14 — tracemalloc Investigation
+
+​```python
+import tracemalloc
+tracemalloc.start(25)
+​```
+
+Snapshot at start, after 1, 10, 50, 100 items. Compare with `snapshot_after_100.compare_to(snapshot_start, "lineno")`. Report top 30 growing allocation sites, grouped by: our executor code / ADK / HTTP libraries / DB libraries / logging-tracing / other dependencies. Focus on monotonically growing allocations.
+
+---
+
+# PHASE 15 — Native vs Python Memory
+
+Compare OCP container RSS, psutil RSS, and tracemalloc-tracked memory. If RSS grows significantly while tracemalloc stays flat, investigate native allocations: grpc, OpenSSL, protobuf, numpy/pandas, DB native drivers, compression libraries, native HTTP libraries, telemetry agents, glibc fragmentation.
+
+---
+
+# PHASE 16 — Heap/Object Investigation
+
+Where safe, use `gc.get_objects()`, `gc.get_count()`, `gc.get_stats()`, and tools like objgraph, pympler, or memray. Report object-type counts at intervals (start / after 10 / after 100 items) for ADK Event, Session, Future, and any other suspect types — this is the strongest direct evidence of retained references.
+
+---
+
+# PHASE 17 — Inspect OpenShift/Kubernetes Deployment
+
+Inspect Deployment/DeploymentConfig, Helm chart, values.yaml, ConfigMap, Dockerfile. Report memory/cpu requests & limits, replicas, autoscaling, probes, terminationGracePeriodSeconds, worker configuration, env vars (`PYTHONMALLOC`, `MALLOC_ARENA_MAX`), gunicorn/uvicorn settings, sidecars, service mesh, monitoring agents.
+
+**cgroup accounting caveat:** confirm whether the "memory" being reported is process RSS from inside the container or `container_memory_working_set_bytes` from cgroups — the latter includes page cache and can appear to grow (and later get reclaimed under pressure) without any leak in the Python process. Compare `ps`/`/proc/self/status` RSS inside the container against the OCP-reported metric before concluding they agree.
+
+Determine whether observed memory belongs only to Python or also includes Istio/Envoy, monitoring sidecar, security agent, or instrumentation agent processes.
+
+---
+
+# PHASE 18 — Docker Runtime Investigation
+
+Inspect Dockerfile: Python version, base image, glibc vs musl, dependency versions, ADK version, package manager, number of processes, entrypoint. Run `ps aux` inside a test container to determine which process actually consumes the memory.
+
+---
+
+# PHASE 19 — Run Isolation Test
+
+Run controlled tests:
+
+* A — 1 item, sequential
+* B — 100 items, sequential
+* C — 100 items, 2 workers
+* D — 100 items, 5 workers
+* E — multiple consecutive runs in the same pod
+
+For each, capture RSS, heap, tracemalloc, thread count, session count, DB connections, ADK sessions, event count, runtime, throughput. Key question: does memory grow with item count, run count, concurrency, output size, tool count, or failures/retries?
+
+---
+
+# PHASE 20 — Failure/Retry Path
+
+Test separately: successful agent, tool timeout, DB exception, agent exception, retryable failure, non-retryable failure. Check whether exceptions retain traceback/frame locals/agent object/session/tool response/request payload — e.g. `self.errors.append(exception)` or `error_details[id] = exc`. Prefer normalized strings/error codes over raw exception objects.
+
+---
+
+# PHASE 21 — Run Completion Cleanup
+
+Find the function executed on run completion. Verify cleanup of: futures, thread pools, sessions, session services, runners, agents, results, event histories, DB sessions, temp files, HTTP/async clients, tracing spans, background tasks, caches, run context. If no explicit cleanup routine exists, design one (conceptually) rather than scattering `gc.collect()` calls before ownership is understood.
+
+---
+
+# PHASE 22 — Architecture Assessment
+
+Evaluate whether a single long-lived Python process handling many runs sequentially remains appropriate. Consider (only if evidence supports it): proper cleanup in the long-lived worker; recycling the worker after N items or after every run; spawning isolated child processes for agent execution; an OCP Job per run for high-isolation workloads; splitting into coordinator + worker deployments. Do not recommend a redesign without evidence.
+
+---
+
+# PHASE 23 — Review Database Claiming
+
+Verify atomic claim semantics so two workers can't claim the same item. For SQL Server: `UPDLOCK`, `READPAST`, `ROWLOCK`. For PostgreSQL: `FOR UPDATE SKIP LOCKED`. Verify claim → commit → execute → update ordering and consider lease/heartbeat fields: `claimed_by`, `claimed_at`, `lease_expiry`, `attempt_count`, `last_error`, `started_at`, `completed_at`. Ensure pod crashes can't permanently strand IN_PROGRESS records.
+
+---
+
+# PHASE 24 — Completion Detection
+
+Inspect the logic that repeatedly rescans for new/pending/failed/in-progress items. Recommend deterministic completion based on counts/state (e.g. `NEW=0, CLAIMED=0, IN_PROGRESS=0, RETRY_ELIGIBLE=0` → COMPLETED or COMPLETED_WITH_ERRORS), and confirm completion checking doesn't itself retain full result sets.
+
+---
+
+# PHASE 25 — Produce Final Investigation Report
+
+1. **Current Architecture** — what the code actually does
+2. **Execution Sequence** — exact request-to-completion flow
+3. **Memory Ownership Map** — major long-lived objects
+4. **Confirmed Problems** — evidence-backed only, classified CRITICAL/HIGH/MEDIUM/LOW
+5. **Suspected Problems** — clearly separated from confirmed
+6. **Memory Growth Evidence** — RSS, tracemalloc, object counts, session counts, thread counts
+7. **Root Cause** — specific, not generic (e.g. "Primary: ADK InMemorySessionService retains sessions/events. Secondary: Executor stores Future/result objects for the entire run. Tertiary: glibc retains freed arenas.")
+8. **Minimal Fix** — lowest-risk production fix
+9. **Recommended Fix** — proper maintainable design
+10. **Architecture Improvements** — only where justified
+11. **Deployment Changes** — OCP/container/runtime config recommendations
+12. **Validation Plan** — exactly how the fix will be proven
+
+---
+
+# PHASE 26 — Only Then Propose Code Changes
+
+For every change: File / Function / Class, Current behavior, Problem, Proposed behavior, Risk, Test required. Do not rewrite unrelated code. Prefer small targeted fixes first.
+
+---
+
+# PHASE 27 — Acceptance Criteria
+
+For sequential execution of 100+ comparable work items: memory rises during warm-up, then plateaus; it does not grow roughly linearly per item; ADK session count and event/history object count do not grow indefinitely; completed futures/tasks are released; DB and HTTP connections remain bounded; run-level objects disappear after run completion.
+
+For multiple consecutive runs in the same pod: memory after completion stays within an explainable bounded range instead of continuously increasing across Run 1 → Run 5.
+
+For parallel execution at MAX_WORKERS=5: no duplicate claims, no stranded work items, correct status updates, no runaway thread/task count, memory remains bounded.
+
+---
+
+# IMPORTANT INVESTIGATION RULES
+
+1. Do not assume high RSS automatically means a Python memory leak — check cgroup accounting and page cache first.
+2. Distinguish live-object retention from allocator-retained memory (malloc_trim test).
+3. Do not solve this only by increasing OCP memory limits.
+4. Do not add `gc.collect()` everywhere without understanding ownership.
+5. Do not blindly restart pods as the only fix.
+6. Do not rewrite the entire architecture before identifying root cause.
+7. Do not change business behavior.
+8. Do not change Kafka semantics unless required.
+9. Preserve existing run/work-item status behavior unless it is incorrect.
+10. Preserve maximum concurrency configuration.
+11. Focus first on sequential execution — the issue occurs there too.
+12. Use evidence from the repository, runtime instrumentation, and deployment configuration.
+13. Explicitly identify which findings are confirmed versus inferred.
+14. When you find an issue, point to the exact file/class/function/code path.
+15. After fixing each issue, rerun the controlled memory tests.
+
+The primary goal: find exactly why memory stays allocated or grows after an ADK work item and after a complete run, fix the real ownership/lifecycle problem, and prove the OCP executor can operate as a stable long-running service.
